@@ -1,0 +1,31 @@
+
+ Here are the specifications for a C program on MacOS. This program helps
+clean-up the current directories by moving or deleting the passed files.
+
+The C program will loop through each file passed on the command line and will
+operate on the file by presenting a menu to the use. The menu options would be:
+
+ 1. Quit
+ 2. Delete
+ 3. Quickview (using the MacOS qlmanage tool)
+ 4. Ignore
+ 5. A list of directories
+
+The list of directories will be taken from a config file probably saved in the
+".config" folder in the home directory. Each directory path will be saved with a
+shortcut key for that directory. User will enter the shortcut key to select a
+directory.
+
+The program will present a list of subdirectories for the selected directory
+along with a serial number. Make sure that the list of files doesn't overflow
+the screen. If needed present the list in a two columns.
+
+Program will move the file to the selected subdirectory that user selects by
+entering the corresponding serial number. If no number is entered then the file
+is moved to the base directory.
+
+Also in the main menu, present an option to move to the same
+directory/subdirectory as the previous one i.e. where the previous file was
+moved.
+
+Provide for appropriate error handling.
