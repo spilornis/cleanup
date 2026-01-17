@@ -205,6 +205,173 @@ void do_quickview(const char *file) {
   }
 }
 
+
+static char *expand_tilde(const char *path) {
+  if (!path)
+    return NULL;
+  if (path[0] != '~')
+    return strdup(path);
+
+  /* Only handle ~ and ~/... */
+  if (path[1] == '/' || path[1] == '\0') {
+    const char *home = getenv("HOME");
+    if (!home)
+      return NULL;
+    size_t need = strlen(home) + strlen(path); /* path includes leading '~' */
+    char *out = malloc(need);
+    if (!out)
+      return NULL;
+    /* skip the ~ */
+    snprintf(out, need, "%s%s", home, path + 1);
+    return out;
+  }
+
+  /* For other forms like ~user/... just return a copy (no expansion) */
+  return strdup(path);
+}
+
+/* A generator used by readline to produce path completions.
+   It returns successive matches on each call with increasing state. */
+static char *path_completion_generator(const char *text, int state) {
+  static DIR *dirp = NULL;
+  static char *dirpart = NULL;
+  static char *pattern = NULL;
+  static size_t pattern_len = 0;
+  struct dirent *entry;
+
+  if (state == 0) {
+    /* initialize search */
+    free(dirpart);
+    free(pattern);
+    dirpart = NULL;
+    pattern = NULL;
+    pattern_len = 0;
+
+    /* split text into directory portion and pattern */
+    const char *slash = strrchr(text, '/');
+    if (slash) {
+      size_t dirlen = slash - text;
+      char tmp[PATH_MAX];
+      if (dirlen == 0) {
+        /* a leading slash: root directory */
+        strcpy(tmp, "/");
+      } else {
+        if (dirlen >= sizeof(tmp))
+          dirlen = sizeof(tmp) - 1;
+        strncpy(tmp, text, dirlen);
+        tmp[dirlen] = '\0';
+      }
+      char *expanded = expand_tilde(tmp);
+      if (!expanded)
+        return NULL;
+      dirpart = strdup(expanded);
+      free(expanded);
+
+      pattern = strdup(slash + 1);
+    } else {
+      dirpart = strdup("."); /* current dir */
+      pattern = strdup(text);
+    }
+    pattern_len = strlen(pattern);
+
+    if (dirpart == NULL || pattern == NULL) {
+      free(dirpart);
+      free(pattern);
+      dirpart = pattern = NULL;
+      return NULL;
+    }
+
+    /* open directory */
+    if (dirp) {
+      closedir(dirp);
+      dirp = NULL;
+    }
+    dirp = opendir(dirpart);
+    if (!dirp) {
+      free(dirpart);
+      free(pattern);
+      dirpart = pattern = NULL;
+      return NULL;
+    }
+  }
+
+  /* iterate entries */
+  while ((entry = readdir(dirp)) != NULL) {
+    const char *name = entry->d_name;
+
+    /* Skip '.' and '..' */
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+      continue;
+
+    /* If pattern doesn't start with a dot, skip hidden files */
+    if (pattern_len == 0) {
+      /* empty pattern: show everything except hidden unless explicitly requested */
+    } else {
+      if (pattern[0] != '.' && name[0] == '.')
+        continue;
+    }
+
+    if (pattern_len > 0) {
+      if (strncmp(name, pattern, pattern_len) != 0)
+        continue;
+    }
+
+    /* Build displayed completion. If dirpart is ".", show only the name;
+       otherwise show dirpart/name. */
+    char candidate[PATH_MAX * 2];
+    if (strcmp(dirpart, ".") == 0) {
+      snprintf(candidate, sizeof(candidate), "%s", name);
+    } else if (strcmp(dirpart, "/") == 0) {
+      /* root directory special-case to avoid double slashes */
+      snprintf(candidate, sizeof(candidate), "/%s", name);
+    } else {
+      snprintf(candidate, sizeof(candidate), "%s/%s", dirpart, name);
+    }
+
+    /* Determine if candidate is a directory and append a trailing slash if so.
+       Use stat on the path (not the possibly relative candidate when dirpart=="."). */
+    char statpath[PATH_MAX * 2];
+    if (strcmp(dirpart, ".") == 0) {
+      snprintf(statpath, sizeof(statpath), "%s", name);
+    } else {
+      snprintf(statpath, sizeof(statpath), "%s/%s", dirpart, name);
+    }
+    struct stat st;
+    int isdir = (stat(statpath, &st) == 0 && S_ISDIR(st.st_mode));
+
+    size_t outlen = strlen(candidate) + (isdir ? 2 : 1); /* +1 for NUL, +1 for '/' if dir */
+    char *out = malloc(outlen);
+    if (!out) {
+      /* on allocation failure, clean up and abort */
+      closedir(dirp);
+      dirp = NULL;
+      free(dirpart);
+      free(pattern);
+      dirpart = pattern = NULL;
+      return NULL;
+    }
+    if (isdir) {
+      snprintf(out, outlen, "%s/", candidate);
+    } else {
+      snprintf(out, outlen, "%s", candidate);
+    }
+
+    return out; /* readline will free this string */
+  }
+
+  /* No more matches: cleanup */
+  if (dirp) {
+    closedir(dirp);
+    dirp = NULL;
+  }
+  free(dirpart);
+  free(pattern);
+  dirpart = pattern = NULL;
+  return NULL;
+}
+
+
+
 /* This function will be called by Readline when the user hits <Tab>.
    It simply defers to Readline's built-in filename completer. */
 static char **my_completion(const char *text, int start, int end) {
@@ -213,7 +380,9 @@ static char **my_completion(const char *text, int start, int end) {
   rl_attempted_completion_over = 1;
 
   /* Ask readline to call its filename completer: */
-  return rl_completion_matches(text, rl_filename_completion_function);
+  /* return rl_completion_matches(text, rl_filename_completion_function); */
+  return rl_completion_matches(
+      text, path_completion_generator);
 }
 
 void collapse_dot_slash(const char *src, char *dst) {
