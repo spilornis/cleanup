@@ -288,8 +288,7 @@ static int rename_or_mv(const char *src, const char *dst) {
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
       printf(GREEN "Moved to %s\n" RESET, dst);
       return 0; /* mv succeeded */
-    }
-    else
+    } else
       return 2; /* mv reported an error */
   }
   return 0;
@@ -298,20 +297,277 @@ static int rename_or_mv(const char *src, const char *dst) {
 void display_menu(const char *file) {
   printf("\n File: " BOLD "%s" RESET "\n", file);
   printf("q) Quit  d) Delete  v) Quickview  i) Ignore  m) Move  p) "
-         "PrevDest c) Custom path\n");
+         /* "PrevDest c) Custom path\n"); */
+         "PrevDest c) Custom path  x) Run external program\n");
+
   printf("Choose: ");
   fflush(stdout);
 }
 
-
 ActionStatus cleanup_delete_file(const char *filepath) {
   if (remove(filepath) == 0) {
-    printf(GREEN "Deleted: %s\n" RESET, filepath);
+    printf(GREEN "\nDeleted: %s\n" RESET, filepath);
     return ACTION_NEXT_FILE;
   } else {
     perror(RED "Error deleting file" RESET);
     return ACTION_CONTINUE_LOOP; // Stay on the same file if deletion fails
   }
+}
+
+ActionStatus cleanup_move_to_prev_dest(const char *file) {
+  if (last_target[0] == 0) {
+    printf(RED "No previous target.\n" RESET);
+    return ACTION_CONTINUE_LOOP;
+  }
+
+  char dest[PATH_MAX];
+  snprintf(dest, PATH_MAX, "%s/%s", last_target,
+           strrchr(file, '/') ? strrchr(file, '/') + 1 : file);
+
+  if (rename_or_mv(file, dest) == 0) {
+    printf(GREEN "Moved to %s\n" RESET, dest);
+    return ACTION_NEXT_FILE;
+  } else
+    return ACTION_CONTINUE_LOOP;
+}
+
+ActionStatus cleanup_move_to_configured_dest(const char *file,
+                                             struct termios *original_termios) {
+
+  if (ndirs == 0) {
+    printf("No dirs in config.\n");
+    return ACTION_CONTINUE_LOOP;
+  }
+  printf("\n");
+  for (int j = 0; j < ndirs; j++) {
+    printf("%c) %s\n", dirs[j].key, dirs[j].path);
+  }
+  printf("Select dir key: ");
+  fflush(stdout);
+
+  /* if (!fgets(buf,sizeof(buf),stdin)) return 0; */
+  /* char key = buf[0]; */
+  char key = getchar();
+
+  int found_idx = -1;
+  for (int j = 0; j < ndirs; j++)
+    if (dirs[j].key == key) {
+      found_idx = j;
+      break;
+    }
+
+  if (found_idx < 0) {
+    printf(RED "Invalid key '%c.\n" RESET, key);
+    return ACTION_CONTINUE_LOOP;
+  }
+
+  char target[PATH_MAX];
+
+  // Restore terminal for the fgets input
+  fflush(stdout);
+  /* restore_mode(&oldt); */
+  restore_mode(original_termios);
+
+  if (choose_subdir(dirs[found_idx].path, target) < 0) {
+    printf(RED "Subdir select error.\n" RESET);
+    /* oldt = enable_raw_mode(); */
+    enable_raw_mode();
+    return ACTION_CONTINUE_LOOP;
+  }
+
+  // Return to raw mode for single char inputs
+  enable_raw_mode();
+
+  char dest[PATH_MAX];
+  snprintf(dest, PATH_MAX, "%s/%s", target,
+           strrchr(file, '/') ? strrchr(file, '/') + 1 : file);
+  /* if (rename(file, dest)==0) { */
+  /*     printf("Moved to %s\n", dest); */
+  /*     strcpy(last_target, target); */
+  /* } else if (errno != EXDEV) { */
+  /*       perror("rename"); */
+  /* } else { */
+  /*   /\* Different filesystems, use external mv command *\/ */
+  /*   run_external_mv(file, dest); */
+  /* } */
+  if (rename_or_mv(file, dest) == 0) {
+    strcpy(last_target, target);
+    return ACTION_NEXT_FILE;
+  } else {
+    return ACTION_CONTINUE_LOOP;
+  }
+}
+
+ActionStatus cleanup_move_to_custom_path(const char *file,
+                                         struct termios *original_termios) {
+
+  /* manual directory entry */
+  char destdir[PATH_MAX];
+  /* printf("Enter destination directory: "); */
+  /* if (!fgets(destdir, sizeof(destdir), stdin))  */
+  /* break; */
+
+  char *readline_str;
+
+  restore_mode(original_termios);
+
+  /* Install our completion function */
+  rl_attempted_completion_function = my_completion;
+
+  /* Loop reading lines until EOF (Ctrl-D) */
+  while ((readline_str = readline("Path> ")) != NULL) {
+    if (readline_str == NULL) {
+      printf("\n");
+      break;
+    }
+    if (*readline_str) {
+      /* non-empty: add to history */
+      add_history(readline_str);
+    }
+    printf("You entered: %s\n", readline_str);
+    char *abs_path = to_absolute(readline_str);
+    if (!abs_path) {
+      printf("Invalid path!\n");
+      free(readline_str);
+      /* free(abs_path); */
+      continue;
+    }
+
+    /* strcpy(destdir, abs_path); */
+    collapse_dot_slash(abs_path, destdir);
+    free(readline_str);
+    free(abs_path);
+    break;
+  }
+
+  enable_raw_mode(); // Re-enable raw mode
+
+  /* strip newline */
+  destdir[strcspn(destdir, "\r\n")] = '\0';
+  /* verify it exists and is a directory */
+  struct stat st;
+  if (stat(destdir, &st) < 0) {
+    perror("stat");
+    return ACTION_CONTINUE_LOOP;
+  }
+  if (!S_ISDIR(st.st_mode)) {
+    fprintf(stderr, "%s is not a directory\n", destdir);
+    return ACTION_CONTINUE_LOOP;
+  }
+  /* build the destination path */
+  const char *fname = strrchr(file, '/');
+  fname = fname ? fname + 1 : file;
+  char dest[PATH_MAX];
+  snprintf(dest, sizeof(dest), "%s/%s", destdir, fname);
+  /* if (rename(file, dest) == 0) { */
+  /*   printf("Moved to %s\n", dest); */
+  /*   strcpy(last_target, destdir); */
+  /* } else { */
+  /*   perror("rename"); */
+  /* } */
+
+  if (rename_or_mv(file, dest) == 0) {
+    strcpy(last_target, dest);
+    printf("Moved to %s\n", dest);
+    return ACTION_NEXT_FILE;
+  } else
+    return ACTION_CONTINUE_LOOP;
+}
+
+
+ActionStatus cleanup_run_external(const char *file, struct termios *original_termios) {
+  /* Restore normal terminal for user input */
+  restore_mode(original_termios);
+
+  /* Read a command line from the user */
+  char *line = readline("Run> ");
+  if (!line) {
+    /* EOF / Ctrl-D */
+    enable_raw_mode();
+    return ACTION_CONTINUE_LOOP;
+  }
+  if (*line)
+    add_history(line);
+
+  /* Tokenize (simple whitespace split). Build argv for execvp. */
+  char *saveptr = NULL;
+  char *tok;
+  char *copy = line;
+  char *argv_exec[64];
+  int argc_exec = 0;
+  int used_placeholder = 0;
+
+  while ((tok = strtok_r(copy, " \t", &saveptr)) != NULL && argc_exec < (int)(sizeof(argv_exec)/sizeof(argv_exec[0]) - 1)) {
+    copy = NULL;
+    char *p = strstr(tok, "{}");
+    if (p) {
+      /* replace {} inside this token with the filename */
+      used_placeholder = 1;
+      size_t newlen = strlen(tok) - 2 + strlen(file) + 1;
+      char *repl = malloc(newlen);
+      if (!repl)
+        break;
+      size_t prefix = p - tok;
+      memcpy(repl, tok, prefix);
+      strcpy(repl + prefix, file);
+      strcpy(repl + prefix + strlen(file), p + 2);
+      argv_exec[argc_exec++] = repl;
+    } else {
+      argv_exec[argc_exec++] = strdup(tok);
+    }
+  }
+
+  /* If no {} seen, append the filename as last argument */
+  if (!used_placeholder && argc_exec < (int)(sizeof(argv_exec)/sizeof(argv_exec[0]) - 1)) {
+    argv_exec[argc_exec++] = strdup(file);
+  }
+  argv_exec[argc_exec] = NULL;
+
+  free(line);
+
+  /* Execute the program */
+  if (argc_exec == 0) {
+    enable_raw_mode();
+    return ACTION_CONTINUE_LOOP;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    perror("fork");
+    /* cleanup */
+    for (int i = 0; i < argc_exec; i++)
+      free(argv_exec[i]);
+    enable_raw_mode();
+    return ACTION_CONTINUE_LOOP;
+  }
+
+  if (pid == 0) {
+    /* child: exec */
+    execvp(argv_exec[0], argv_exec);
+    /* if execvp fails */
+    perror("execvp");
+    _exit(127);
+  }
+
+  /* parent: wait and report status */
+  int status = 0;
+  if (waitpid(pid, &status, 0) < 0) {
+    perror("waitpid");
+  } else {
+    if (WIFEXITED(status)) {
+      printf("Process exited with status %d\n", WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+      printf("Process killed by signal %d\n", WTERMSIG(status));
+    }
+  }
+
+  /* cleanup argv memory */
+  for (int i = 0; i < argc_exec; i++)
+    free(argv_exec[i]);
+
+  /* Return to raw mode before returning */
+  enable_raw_mode();
+  return ACTION_CONTINUE_LOOP;
 }
 
 
@@ -325,6 +581,7 @@ int main(int argc, char *argv[]) {
 
   struct termios oldt = enable_raw_mode();
 
+  /* Loop through all files */
   for (int i = 1; i < argc; i++) {
     char *file = argv[i];
     if (access(file, F_OK) != 0) {
@@ -341,12 +598,12 @@ int main(int argc, char *argv[]) {
       opt = getchar();
 
       /* if (opt==1) return 0; */
-      if (opt == 113)        // input: 'q'uit
+      if (opt == 113) // input: 'q'uit
         return 0;
       /* else if (opt==2) { */
       else if (opt == 100) { // input: 'd'elete
         if (remove(file) == 0)
-          printf("Deleted.\n");
+          printf(GREEN "\nDeleted.\n" RESET);
         else
           perror("Delete");
         break;
@@ -357,156 +614,36 @@ int main(int argc, char *argv[]) {
       } else if (opt == 105) { // input: 'i'gnore
         break;
 
-
         /* } else if (opt==6) { */
       } else if (opt == 112) { // input: 'p'revdest
-        if (last_target[0] == 0) {
-          printf("No previous target.\n");
+        if (cleanup_move_to_prev_dest(file) == ACTION_NEXT_FILE)
+          break;
+        else
           continue;
-        }
-        char dest[PATH_MAX];
-        snprintf(dest, PATH_MAX, "%s/%s", last_target,
-                 strrchr(file, '/') ? strrchr(file, '/') + 1 : file);
-        if (rename_or_mv(file, dest) == 0) {
-          printf("Moved to %s\n", dest);
-        } else
-          continue;
-        /* if (rename(file, dest) == 0) { */
-        /*   printf("Moved to %s\n", dest); */
-        /* } else { */
-        /*   perror("Move"); */
-        /* } */
-
-        break;
-
 
         /* } else if (opt==5) { */
       } else if (opt == 109) { // input: 'm'ove
-        if (ndirs == 0) {
-          printf("No dirs in config.\n");
-          continue;
-        }
-        printf("\n");
-        for (int j = 0; j < ndirs; j++) {
-          printf("%c) %s\n", dirs[j].key, dirs[j].path);
-        }
-        printf("Select dir key: ");
-
-        /* if (!fgets(buf,sizeof(buf),stdin)) return 0; */
-        /* char key = buf[0]; */
-        char key = getchar();
-
-        int found = -1;
-        for (int j = 0; j < ndirs; j++)
-          if (dirs[j].key == key) {
-            found = j;
-            break;
-          }
-        if (found < 0) {
-          printf("Invalid.\n");
-          continue;
-        }
-        char target[PATH_MAX];
-
-        // Restore terminal for the fgets input
-        fflush(stdin);
-        restore_mode(&oldt);
-
-        if (choose_subdir(dirs[found].path, target) < 0) {
-          printf("Subdir select error.\n");
-          oldt = enable_raw_mode();
-          continue;
-        }
-
-        // Return to raw mode for single char inputs
-        oldt = enable_raw_mode();
-
-        char dest[PATH_MAX];
-        snprintf(dest, PATH_MAX, "%s/%s", target,
-                 strrchr(file, '/') ? strrchr(file, '/') + 1 : file);
-        /* if (rename(file, dest)==0) { */
-        /*     printf("Moved to %s\n", dest); */
-        /*     strcpy(last_target, target); */
-        /* } else if (errno != EXDEV) { */
-        /*       perror("rename"); */
-        /* } else { */
-        /*   /\* Different filesystems, use external mv command *\/ */
-        /*   run_external_mv(file, dest); */
-        /* } */
-        if (rename_or_mv(file, dest) == 0) {
-          strcpy(last_target, target);
+        if (cleanup_move_to_configured_dest(file, &oldt) == ACTION_NEXT_FILE)
           break;
-        } else {
+        else
           continue;
-        }
-
 
         /* } else if (opt == 7) { */
       } else if (opt == 99) { // input: 'c'ustom path
-        /* manual directory entry */
-        char destdir[PATH_MAX];
-        /* printf("Enter destination directory: "); */
-        /* if (!fgets(destdir, sizeof(destdir), stdin))  */
-        /* break; */
-
-        char *readline_str;
-
-        /* Install our completion function */
-        rl_attempted_completion_function = my_completion;
-
-        /* Loop reading lines until EOF (Ctrl-D) */
-        while ((readline_str = readline("Path> ")) != NULL) {
-          if (*readline_str) {
-            /* non-empty: add to history */
-            add_history(readline_str);
-          }
-          printf("You entered: %s\n", readline_str);
-          char *abs_path = to_absolute(readline_str);
-          if (!abs_path) {
-            printf("Invalid path!\n");
-            free(readline_str);
-            /* free(abs_path); */
-            continue;
-          }
-
-          /* strcpy(destdir, abs_path); */
-          collapse_dot_slash(abs_path, destdir);
-          free(readline_str);
-          free(abs_path);
+        if (cleanup_move_to_custom_path(file, &oldt) == ACTION_NEXT_FILE)
           break;
-        }
+        else
+          continue;
+      } else if (opt == 120) { // input: 'x' run external command
+        if (cleanup_run_external(file, &oldt) == ACTION_NEXT_FILE)
+          break;
+        else
+          continue;
 
-        /* strip newline */
-        destdir[strcspn(destdir, "\r\n")] = '\0';
-        /* verify it exists and is a directory */
-        struct stat st;
-        if (stat(destdir, &st) < 0) {
-          perror("stat");
-          continue;
-        }
-        if (!S_ISDIR(st.st_mode)) {
-          fprintf(stderr, "%s is not a directory\n", destdir);
-          continue;
-        }
-        /* build the destination path */
-        const char *fname = strrchr(file, '/');
-        fname = fname ? fname + 1 : file;
-        char dest[PATH_MAX];
-        snprintf(dest, sizeof(dest), "%s/%s", destdir, fname);
-        /* if (rename(file, dest) == 0) { */
-        /*   printf("Moved to %s\n", dest); */
-        /*   strcpy(last_target, destdir); */
-        /* } else { */
-        /*   perror("rename"); */
-        /* } */
-
-        if (rename_or_mv(file, dest) == 0) {
-          printf("Moved to %s\n", dest);
-        } else
-          continue;
       } else {
         printf("Bad option.\n");
       }
+
     }
   }
 
