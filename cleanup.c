@@ -24,6 +24,7 @@
 #define MAX_DIRS 100
 #define MAX_SUBS 1000
 #define BUF_SIZE 1024
+#define CACHE_SIZE 15 // Size of the directory cache
 
 #define RED "\033[31m"
 #define GREEN "\033[32m"
@@ -31,14 +32,25 @@
 #define BOLD "\033[1m"
 #define RESET "\033[0m"
 
+
 typedef struct {
   char key;
   char *path;
 } DirEntry;
 
+// --- Subdirectory Cache Structure ---
+typedef struct {
+  char base_path[PATH_MAX];
+  char subs[MAX_SUBS][PATH_MAX];
+  int n_subs;
+} SubdirCacheEntry;
+
 static DirEntry dirs[MAX_DIRS];
 static int ndirs = 0;
 static char last_target[PATH_MAX] = {0};
+
+// Global Cache Storage
+static SubdirCacheEntry subdir_cache[CACHE_SIZE] = {0};
 
 // Enum to define the outcome of an action on a file
 typedef enum {
@@ -46,8 +58,6 @@ typedef enum {
   ACTION_NEXT_FILE,     // Go to the next file in the argv list
   ACTION_QUIT_PROGRAM   // Exit the program entirely
 } ActionStatus;
-
-
 
 char *to_absolute(const char *input) {
   if (!input)
@@ -95,7 +105,6 @@ char *to_absolute(const char *input) {
   return resolved; // caller must free()
 }
 
-
 void load_config() {
   char *home = getenv("HOME");
   if (!home)
@@ -136,6 +145,22 @@ void load_config() {
 }
 
 int list_subdirs(const char *base, char subs[][PATH_MAX]) {
+
+  // 1. Check cache
+  for (int i = 0; i < CACHE_SIZE; i++) {
+    if (subdir_cache[i].base_path[0] != '\0' &&
+        strcmp(subdir_cache[i].base_path, base) == 0) {
+      // Cache hit! Copy data and return count immediately.
+      int n = subdir_cache[i].n_subs;
+      for (int j = 0; j < n; j++) {
+        strcpy(subs[j], subdir_cache[i].subs[j]);
+      }
+      return n;
+    }
+  }
+
+  // 2. Cache miss: Perform expensive disk operation
+
   DIR *d = opendir(base);
   if (!d)
     return -1;
@@ -152,6 +177,23 @@ int list_subdirs(const char *base, char subs[][PATH_MAX]) {
     }
   }
   closedir(d);
+
+  // 3. Update cache (Simple circular replacement/eviction)
+  static int cache_idx = 0;
+
+  // Store results in the current cache slot
+  strncpy(subdir_cache[cache_idx].base_path, base, PATH_MAX);
+  subdir_cache[cache_idx].base_path[PATH_MAX - 1] = '\0';
+  subdir_cache[cache_idx].n_subs = n;
+
+  for (int i = 0; i < n; i++) {
+    strcpy(subdir_cache[cache_idx].subs[i], subs[i]);
+  }
+
+  // Move to the next slot (circular)
+  cache_idx = (cache_idx + 1) % CACHE_SIZE;
+
+
   return n;
 }
 
