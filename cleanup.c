@@ -678,7 +678,7 @@ ActionStatus cleanup_move_to_custom_path(const char *file,
   /* } */
 
   if (rename_or_mv(file, dest) == 0) {
-    strcpy(last_target, dest);
+    strcpy(last_target, destdir);
     printf("Moved to %s\n", dest);
     return ACTION_NEXT_FILE;
   } else
