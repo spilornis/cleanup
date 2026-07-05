@@ -6,12 +6,14 @@
   entered destinations. Also allows to view the file to make it easy to decide.
 
   Platform: MacOS
+  Date: 16 Jan 2026
 */
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <readline/history.h>
 #include <readline/readline.h>
+#include <libgen.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -466,7 +468,7 @@ static void restore_mode(const struct termios *oldt) {
 static int rename_or_mv(const char *src, const char *dst) {
 
   if (rename(src, dst) == 0) {
-    printf(GREEN "Moved to %s\n" RESET, dst);
+    printf(GREEN "\nMoved to %s\n" RESET, dst);
     return 0;
     /* strcpy(last_target, target); */
   } else if (errno != EXDEV) {
@@ -507,7 +509,7 @@ static int rename_or_mv(const char *src, const char *dst) {
 
 void display_menu(const char *file) {
   printf("\n File: " BOLD "%s" RESET "\n", file);
-  printf("q) Quit  d) Delete  v) Quickview  i) Ignore  m) Move  p) "
+  printf(BOLD "q)" RESET "Quit  d) Delete  v) Quickview  i) Ignore  m) Move  p) "
          /* "PrevDest c) Custom path\n"); */
          "PrevDest c) Custom path  x) Run external program\n");
 
@@ -550,8 +552,15 @@ ActionStatus cleanup_move_to_configured_dest(const char *file,
     return ACTION_CONTINUE_LOOP;
   }
   printf("\n");
+
+  char path_copy[300];
+
   for (int j = 0; j < ndirs; j++) {
-    printf("%c) %s\n", dirs[j].key, dirs[j].path);
+    /* strcpy(path_copy, dirs[j].path); */
+    snprintf(path_copy, sizeof(path_copy), "%s", dirs[j].path);
+    /* printf("%c) %s\n", dirs[j].key, dirs[j].path); */
+    printf("%c) " BOLD "%-20s" RESET "\t %s\n", dirs[j].key,
+           basename(path_copy), dirs[j].path);
   }
   printf("Select dir key: ");
   fflush(stdout);
@@ -679,7 +688,7 @@ ActionStatus cleanup_move_to_custom_path(const char *file,
 
   if (rename_or_mv(file, dest) == 0) {
     strcpy(last_target, destdir);
-    printf("Moved to %s\n", dest);
+    printf("\nMoved to %s\n", dest);
     return ACTION_NEXT_FILE;
   } else
     return ACTION_CONTINUE_LOOP;
