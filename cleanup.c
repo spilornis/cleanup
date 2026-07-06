@@ -5,6 +5,8 @@
   on command line and then deletes then or moves them to configured or manually
   entered destinations. Also allows to view the file to make it easy to decide.
 
+  By Rajgopal Patil
+
   Platform: MacOS
   Date: 16 Jan 2026
 */
