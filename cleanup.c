@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -467,46 +468,165 @@ static void restore_mode(const struct termios *oldt) {
   tcsetattr(STDIN_FILENO, TCSANOW, oldt);
 }
 
-static int rename_or_mv(const char *src, const char *dst) {
+/* --- Move Queue: backgrounds Cross-Filesystem Moves without threads.
+   Only one Move is ever In-Flight; the rest wait in a FIFO list. Progress is
+   tracked via non-blocking waitpid(WNOHANG) polling from the main loop. --- */
 
-  if (rename(src, dst) == 0) {
-    printf(GREEN "\nMoved to %s\n" RESET, dst);
+typedef struct MoveQueueItem {
+  char src[PATH_MAX];
+  char dst[PATH_MAX];
+  struct MoveQueueItem *next;
+} MoveQueueItem;
+
+static MoveQueueItem *move_queue_head = NULL;
+static MoveQueueItem *move_queue_tail = NULL;
+
+static pid_t inflight_pid = -1;
+static char inflight_src[PATH_MAX];
+static char inflight_dst[PATH_MAX];
+
+/* Returns 1 on success, 0 if the Move could not be queued (e.g. malloc
+   failure) — callers must treat 0 as a failure to report, not a success. */
+static int move_queue_push(const char *src, const char *dst) {
+  MoveQueueItem *item = malloc(sizeof(MoveQueueItem));
+  if (!item) {
+    perror("malloc");
     return 0;
-    /* strcpy(last_target, target); */
-  } else if (errno != EXDEV) {
-    perror("rename");
-    return -1;
-  } else {
-    /* Different filesystems, use external mv command */
+  }
+  strncpy(item->src, src, PATH_MAX - 1);
+  item->src[PATH_MAX - 1] = '\0';
+  strncpy(item->dst, dst, PATH_MAX - 1);
+  item->dst[PATH_MAX - 1] = '\0';
+  item->next = NULL;
+
+  if (move_queue_tail)
+    move_queue_tail->next = item;
+  else
+    move_queue_head = item;
+  move_queue_tail = item;
+  return 1;
+}
+
+/* Fork+exec the next queued Move if none is currently In-Flight. Loops
+   (rather than recursing) past any Moves that fail to fork, so a run of
+   fork() failures can't grow the call stack with queue depth. */
+static void move_queue_start_next(void) {
+  while (inflight_pid == -1 && move_queue_head) {
+    MoveQueueItem *item = move_queue_head;
+    move_queue_head = item->next;
+    if (!move_queue_head)
+      move_queue_tail = NULL;
+
+    strcpy(inflight_src, item->src);
+    strcpy(inflight_dst, item->dst);
+    free(item);
+
+    printf(BLUE "\nMoving %s\n" RESET, inflight_src);
+    fflush(stdout);
 
     pid_t pid = fork();
     if (pid < 0) {
       perror("fork");
-      return 3;
+      printf(RED "Move failed: %s\n" RESET, inflight_src);
+      fflush(stdout);
+      continue; /* try the next queued item */
     }
 
     if (pid == 0) { /* child */
-      /* Replace the child process with /bin/mv */
-      execlp("mv", "mv", "-f", src, dst, (char *)NULL);
-      /* If execlp returns, an error occurred */
+      execlp("mv", "mv", "-f", inflight_src, inflight_dst, (char *)NULL);
       perror("execlp");
       _exit(3);
     }
 
-    /* parent – wait for child */
-    int status;
-    if (waitpid(pid, &status, 0) < 0) {
-      perror("waitpid");
-      return 3;
-    }
-
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-      printf(GREEN "Moved to %s\n" RESET, dst);
-      return 0; /* mv succeeded */
-    } else
-      return 2; /* mv reported an error */
+    inflight_pid = pid; /* parent: track, do not wait */
   }
-  return 0;
+}
+
+/* Reports the outcome of the In-Flight Move and starts the next queued one,
+   if any. Shared by the non-blocking poll and the blocking drain. */
+static void move_queue_finish_inflight(int status) {
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+    printf(GREEN "\nMoved %s to %s\n" RESET, inflight_src, inflight_dst);
+  else
+    printf(RED "\nMove failed: %s (left in place)\n" RESET, inflight_src);
+  fflush(stdout);
+
+  inflight_pid = -1;
+  move_queue_start_next();
+}
+
+/* Non-blocking check of the In-Flight Move. Safe to call often (e.g. every
+   spin of the select()-based input loop); it is a no-op unless something
+   just finished. */
+static void move_queue_poll(void) {
+  if (inflight_pid == -1)
+    return;
+
+  int status;
+  pid_t r = waitpid(inflight_pid, &status, WNOHANG);
+  if (r == 0)
+    return; /* still running */
+  if (r < 0) {
+    if (errno == EINTR)
+      return;
+    perror("waitpid");
+    inflight_pid = -1;
+    move_queue_start_next();
+    return;
+  }
+
+  move_queue_finish_inflight(status);
+}
+
+/* Block until the Move Queue (including the In-Flight Move) is empty. Called
+   before the program exits so a Cross-Filesystem Move never gets truncated
+   at the destination. */
+static void move_queue_drain(void) {
+  if (inflight_pid == -1 && !move_queue_head)
+    return;
+
+  printf(BLUE "\nDraining Move Queue...\n" RESET);
+  fflush(stdout);
+
+  move_queue_start_next();
+  while (inflight_pid != -1) {
+    int status;
+    pid_t r = waitpid(inflight_pid, &status, 0);
+    if (r < 0) {
+      if (errno == EINTR)
+        continue;
+      perror("waitpid");
+      inflight_pid = -1;
+      move_queue_start_next();
+      continue;
+    }
+    move_queue_finish_inflight(status);
+  }
+}
+
+typedef enum {
+  MOVE_LOCAL_OK,    /* Local Move: rename() succeeded immediately */
+  MOVE_LOCAL_ERROR, /* rename() failed for a reason other than EXDEV, or the
+                        Move could not be placed on the Move Queue */
+  MOVE_QUEUED       /* Cross-Filesystem Move: placed on the Move Queue */
+} MoveOutcome;
+
+static MoveOutcome rename_or_queue(const char *src, const char *dst) {
+  if (rename(src, dst) == 0) {
+    printf(GREEN "\nMoved to %s\n" RESET, dst);
+    return MOVE_LOCAL_OK;
+  }
+  if (errno != EXDEV) {
+    perror("rename");
+    return MOVE_LOCAL_ERROR;
+  }
+
+  if (!move_queue_push(src, dst)) {
+    printf(RED "Move failed: could not queue %s\n" RESET, src);
+    return MOVE_LOCAL_ERROR;
+  }
+  move_queue_start_next();
+  return MOVE_QUEUED;
 }
 
 void display_menu(const char *file) {
@@ -539,11 +659,8 @@ ActionStatus cleanup_move_to_prev_dest(const char *file) {
   snprintf(dest, PATH_MAX, "%s/%s", last_target,
            strrchr(file, '/') ? strrchr(file, '/') + 1 : file);
 
-  if (rename_or_mv(file, dest) == 0) {
-    printf(GREEN "Moved to %s\n" RESET, dest);
-    return ACTION_NEXT_FILE;
-  } else
-    return ACTION_CONTINUE_LOOP;
+  return rename_or_queue(file, dest) != MOVE_LOCAL_ERROR ? ACTION_NEXT_FILE
+                                                          : ACTION_CONTINUE_LOOP;
 }
 
 ActionStatus cleanup_move_to_configured_dest(const char *file,
@@ -612,7 +729,7 @@ ActionStatus cleanup_move_to_configured_dest(const char *file,
   /*   /\* Different filesystems, use external mv command *\/ */
   /*   run_external_mv(file, dest); */
   /* } */
-  if (rename_or_mv(file, dest) == 0) {
+  if (rename_or_queue(file, dest) != MOVE_LOCAL_ERROR) {
     strcpy(last_target, target);
     return ACTION_NEXT_FILE;
   } else {
@@ -688,9 +805,8 @@ ActionStatus cleanup_move_to_custom_path(const char *file,
   /*   perror("rename"); */
   /* } */
 
-  if (rename_or_mv(file, dest) == 0) {
+  if (rename_or_queue(file, dest) != MOVE_LOCAL_ERROR) {
     strcpy(last_target, destdir);
-    printf("\nMoved to %s\n", dest);
     return ACTION_NEXT_FILE;
   } else
     return ACTION_CONTINUE_LOOP;
@@ -793,6 +909,39 @@ ActionStatus cleanup_run_external(const char *file, struct termios *original_ter
 }
 
 
+/* Waits for a single character on stdin without blocking Move Queue status
+   updates: polls the In-Flight Move on each select() timeout so completions
+   print live instead of waiting for the next keypress. */
+static int wait_for_input_char(void) {
+  for (;;) {
+    move_queue_poll();
+
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 200000};
+
+    int rv = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv);
+    if (rv < 0) {
+      if (errno == EINTR)
+        continue;
+      perror("select");
+      return EOF;
+    }
+    if (rv > 0 && FD_ISSET(STDIN_FILENO, &fds))
+      return getchar();
+    /* timeout: loop back around and poll the queue again */
+  }
+}
+
+/* Drains the Move Queue and restores the terminal before exiting, whether
+   the user quit explicitly or the file list ran out. */
+static int drain_and_exit(struct termios *oldt) {
+  move_queue_drain();
+  restore_mode(oldt);
+  return 0;
+}
+
 int main(int argc, char *argv[]) {
   if (argc < 2) {
     fprintf(stderr, "Usage: %s file1 [file2...]\n", argv[0]);
@@ -817,11 +966,11 @@ int main(int argc, char *argv[]) {
       /* int opt = atoi(buf); */
 
       int opt;
-      opt = getchar();
+      opt = wait_for_input_char();
 
       /* if (opt==1) return 0; */
       if (opt == 113) // input: 'q'uit
-        return 0;
+        return drain_and_exit(&oldt);
       /* else if (opt==2) { */
       else if (opt == 100) { // input: 'd'elete
         if (remove(file) == 0)
@@ -869,7 +1018,5 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  restore_mode(&oldt);
-
-  return 0;
+  return drain_and_exit(&oldt);
 }
