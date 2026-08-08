@@ -5,3 +5,4 @@
 /tests/cleanup_test.dSYM/Contents/Info.plist
 /tests/cleanup_test.dSYM/Contents/Resources/DWARF/cleanup_test
 tests/cleanup_test
+/.DS_Store
