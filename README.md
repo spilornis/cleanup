@@ -43,10 +43,18 @@ Config format is `key:/absolute/path/` (one per line). The key is the shortcut y
    2. Delete (**BEWARE**: **DELETES** the file. NO RECOVERY!)
    3. Quickview (macOS Quick Look)
    4. Ignore
-   5. Move (pick from `cleanup.conf`)
+   5. Move (pick a Configured Destination from `cleanup.conf`, then narrow to a subdirectory with the Directory Picker)
    6. PrevDest (reuse last destination)
    7. Custom (enter a path)
    8. Run external program
+
+## Directory Picker
+After choosing a Configured Destination's key, `cleanup` opens a broot-style picker over that destination's entire directory tree (not just its top-level folders):
+- Type a few letters to fuzzy-filter the list (e.g. `gam` matches `beta/gamma`).
+- Use the Up/Down arrow keys to move the highlighted selection.
+- Press Enter to move the file there, or Esc to cancel back to the file menu.
+
+The tree is indexed once per destination and cached for the rest of the run, so only the first Move into a given destination pays the disk-walk cost.
 
 ## Options
 No flags. Provide one or more files:

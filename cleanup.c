@@ -10,6 +10,7 @@
   Platform: MacOS
   Date: 16 Jan 2026
 */
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
@@ -27,9 +28,10 @@
 #include <unistd.h>
 
 #define MAX_DIRS 100
-#define MAX_SUBS 1000
 #define BUF_SIZE 1024
-#define CACHE_SIZE 15 // Size of the directory cache
+#define MAX_ALL_DIRS 4000    // Max directories indexed per destination tree
+#define DIR_TREE_CACHE_SIZE 6 // How many destination trees stay cached
+#define MAX_FILTER 256        // Max length of the broot-style filter query
 
 #define RED "\033[31m"
 #define GREEN "\033[32m"
@@ -43,19 +45,25 @@ typedef struct {
   char *path;
 } DirEntry;
 
-// --- Subdirectory Cache Structure ---
+/* Defined further down; forward-declared so the picker (defined earlier in
+   the file) can restore normal raw-with-echo mode when it's done. */
+static struct termios enable_raw_mode(void);
+
+// --- Directory-tree Cache Structure ---
+// Caches the full recursive directory listing under a given base path, so
+// repeated Moves into the same Configured Destination don't re-walk disk.
 typedef struct {
   char base_path[PATH_MAX];
-  char subs[MAX_SUBS][PATH_MAX];
+  char subs[MAX_ALL_DIRS][PATH_MAX];
   int n_subs;
-} SubdirCacheEntry;
+} DirTreeCacheEntry;
 
 static DirEntry dirs[MAX_DIRS];
 static int ndirs = 0;
 static char last_target[PATH_MAX] = {0};
 
 // Global Cache Storage
-static SubdirCacheEntry subdir_cache[CACHE_SIZE] = {0};
+static DirTreeCacheEntry dir_tree_cache[DIR_TREE_CACHE_SIZE] = {0};
 
 // Enum to define the outcome of an action on a file
 typedef enum {
@@ -149,97 +157,233 @@ void load_config() {
   fclose(f);
 }
 
-int list_subdirs(const char *base, char subs[][PATH_MAX]) {
+/* Recursively collects every directory under base into dirs_out, as paths
+   relative to base ("" for base itself is seeded by the caller, not here).
+   Hidden directories (name starting with '.') are skipped entirely, along
+   with anything below them. Uses lstat rather than stat so a symlink back
+   up the tree can't send the recursion into an infinite loop. Stops once
+   *n reaches max. */
+static void collect_dirs_recursive(const char *base, const char *relpath,
+                                    char dirs_out[][PATH_MAX], int *n,
+                                    int max) {
+  if (*n >= max)
+    return;
 
+  char full[PATH_MAX];
+  if (relpath[0] == '\0')
+    snprintf(full, sizeof(full), "%s", base);
+  else
+    snprintf(full, sizeof(full), "%s/%s", base, relpath);
+
+  DIR *d = opendir(full);
+  if (!d)
+    return;
+
+  struct dirent *ent;
+  while ((ent = readdir(d)) && *n < max) {
+    if (ent->d_name[0] == '.')
+      continue;
+
+    char childrel[PATH_MAX];
+    if (relpath[0] == '\0')
+      snprintf(childrel, sizeof(childrel), "%s", ent->d_name);
+    else
+      snprintf(childrel, sizeof(childrel), "%s/%s", relpath, ent->d_name);
+
+    char childfull[PATH_MAX];
+    snprintf(childfull, sizeof(childfull), "%s/%s", full, ent->d_name);
+
+    struct stat st;
+    if (lstat(childfull, &st) == 0 && S_ISDIR(st.st_mode)) {
+      strncpy(dirs_out[*n], childrel, PATH_MAX - 1);
+      dirs_out[*n][PATH_MAX - 1] = '\0';
+      (*n)++;
+      collect_dirs_recursive(base, childrel, dirs_out, n, max);
+    }
+  }
+  closedir(d);
+}
+
+/* Returns every directory in the tree rooted at base (base itself included,
+   as the empty-string entry at index 0), relative to base. Cached per base
+   path so repeat Moves into the same Configured Destination don't re-walk
+   disk. */
+static int list_all_dirs(const char *base, char subs[][PATH_MAX]) {
   // 1. Check cache
-  for (int i = 0; i < CACHE_SIZE; i++) {
-    if (subdir_cache[i].base_path[0] != '\0' &&
-        strcmp(subdir_cache[i].base_path, base) == 0) {
-      // Cache hit! Copy data and return count immediately.
-      int n = subdir_cache[i].n_subs;
-      for (int j = 0; j < n; j++) {
-        strcpy(subs[j], subdir_cache[i].subs[j]);
-      }
+  for (int i = 0; i < DIR_TREE_CACHE_SIZE; i++) {
+    if (dir_tree_cache[i].base_path[0] != '\0' &&
+        strcmp(dir_tree_cache[i].base_path, base) == 0) {
+      int n = dir_tree_cache[i].n_subs;
+      for (int j = 0; j < n; j++)
+        strcpy(subs[j], dir_tree_cache[i].subs[j]);
       return n;
     }
   }
 
-  // 2. Cache miss: Perform expensive disk operation
-
-  DIR *d = opendir(base);
-  if (!d)
+  // 2. Cache miss: walk the tree
+  struct stat st;
+  if (stat(base, &st) != 0 || !S_ISDIR(st.st_mode))
     return -1;
-  struct dirent *ent;
+
   int n = 0;
-  while ((ent = readdir(d)) && n < MAX_SUBS) {
-    if (ent->d_name[0] == '.')
-      continue;
-    char full[PATH_MAX];
-    snprintf(full, sizeof(full), "%s/%s", base, ent->d_name);
-    struct stat st;
-    if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
-      strcpy(subs[n++], ent->d_name);
-    }
-  }
-  closedir(d);
+  strcpy(subs[n++], ""); // base itself
+  collect_dirs_recursive(base, "", subs, &n, MAX_ALL_DIRS);
 
-  // 3. Update cache (Simple circular replacement/eviction)
+  // 3. Update cache (simple circular replacement/eviction)
   static int cache_idx = 0;
-
-  // Store results in the current cache slot
-  strncpy(subdir_cache[cache_idx].base_path, base, PATH_MAX);
-  subdir_cache[cache_idx].base_path[PATH_MAX - 1] = '\0';
-  subdir_cache[cache_idx].n_subs = n;
-
-  for (int i = 0; i < n; i++) {
-    strcpy(subdir_cache[cache_idx].subs[i], subs[i]);
-  }
-
-  // Move to the next slot (circular)
-  cache_idx = (cache_idx + 1) % CACHE_SIZE;
-
+  strncpy(dir_tree_cache[cache_idx].base_path, base, PATH_MAX - 1);
+  dir_tree_cache[cache_idx].base_path[PATH_MAX - 1] = '\0';
+  dir_tree_cache[cache_idx].n_subs = n;
+  for (int i = 0; i < n; i++)
+    strcpy(dir_tree_cache[cache_idx].subs[i], subs[i]);
+  cache_idx = (cache_idx + 1) % DIR_TREE_CACHE_SIZE;
 
   return n;
 }
 
-void print_two_cols(char subs[][PATH_MAX], int n) {
-  printf("\n");
-  int cols = (n > 20) ? 2 : 1;
-  int mid = (n + cols - 1) / cols;
-  for (int i = 0; i < mid; i++) {
-    for (int c = 0; c < cols; c++) {
-      int idx = i + c * mid;
-      if (idx < n) {
-        printf("%3d: %-30s", idx + 1, subs[idx]);
-      }
+/* Case-insensitive subsequence match: true if every character of pat
+   appears in s in order (not necessarily contiguous), broot/fzf-style. An
+   empty pattern matches everything. */
+static int fuzzy_match(const char *s, const char *pat) {
+  if (!*pat)
+    return 1;
+  for (; *s; s++) {
+    if (tolower((unsigned char)*s) == tolower((unsigned char)*pat)) {
+      pat++;
+      if (!*pat)
+        return 1;
     }
-    printf("\n");
   }
+  return 0;
 }
 
-int choose_subdir(const char *base, char *outpath) {
-  char subs[MAX_SUBS][PATH_MAX];
-  int n = list_subdirs(base, subs);
+/* Raw, no-echo terminal mode for the picker's own rendering (unlike
+   enable_raw_mode(), this also disables ECHO so typed filter characters
+   don't get echoed twice). Returns the previous settings. */
+static struct termios enable_raw_mode_noecho(void) {
+  struct termios oldt, newt;
+  tcgetattr(STDIN_FILENO, &oldt);
+  newt = oldt;
+  newt.c_lflag &= ~(ICANON | ECHO);
+  newt.c_cc[VMIN] = 1;
+  newt.c_cc[VTIME] = 0;
+  tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+  return oldt;
+}
+
+/* Broot-style interactive directory picker. Indexes every directory under
+   base (base itself included, shown as "."), then lets the user narrow the
+   list down by typing a fuzzy filter, moving the highlighted selection with
+   the arrow keys, and confirming with Enter. Esc cancels.
+
+   Manages the terminal itself (raw, no echo) and leaves it back in the
+   program's normal raw-with-echo mode before returning. On success, fills
+   outpath with the chosen absolute directory and returns 0; returns -1 if
+   the user cancelled, the walk failed, or nothing was selected. */
+static int pick_dir_broot(const char *base, char *outpath) {
+  static char all[MAX_ALL_DIRS][PATH_MAX];
+  int n = list_all_dirs(base, all);
   if (n < 0)
     return -1;
-  if (n == 0) {
-    strcpy(outpath, base);
-    return 0;
+
+  enable_raw_mode_noecho();
+
+  char query[MAX_FILTER] = {0};
+  int qlen = 0;
+  int sel = 0;
+  int matches[MAX_ALL_DIRS];
+  int nmatches = 0;
+  int result = -1;
+  const int page = 15;
+
+  for (;;) {
+    nmatches = 0;
+    for (int i = 0; i < n; i++) {
+      if (fuzzy_match(all[i], query))
+        matches[nmatches++] = i;
+    }
+    if (sel >= nmatches)
+      sel = nmatches > 0 ? nmatches - 1 : 0;
+    if (sel < 0)
+      sel = 0;
+
+    // render
+    printf("\033[2J\033[H");
+    printf(BOLD "Move to: %s" RESET "\n", base);
+    printf("Filter: %s" RESET "\n\n", query);
+
+    int start = (sel >= page) ? sel - page + 1 : 0;
+    int end = start + page;
+    if (end > nmatches)
+      end = nmatches;
+    for (int i = start; i < end; i++) {
+      const char *name = all[matches[i]][0] ? all[matches[i]] : ".";
+      if (i == sel)
+        printf(GREEN "> %-60s" RESET "\n", name);
+      else
+        printf("  %-60s\n", name);
+    }
+    if (nmatches == 0)
+      printf(RED "  (no matches)" RESET "\n");
+
+    printf("\n%d/%d dirs   [type to filter, arrows to move, Enter to "
+           "select, Esc to cancel]\n",
+           nmatches, n);
+    fflush(stdout);
+
+    int c = getchar();
+    if (c == EOF) {
+      result = -1;
+      break;
+    } else if (c == 27) { // Esc, or the start of an arrow-key sequence
+      fd_set fds;
+      struct timeval tv = {0, 50000};
+      FD_ZERO(&fds);
+      FD_SET(STDIN_FILENO, &fds);
+      if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
+        int c2 = getchar();
+        if (c2 == '[') {
+          int c3 = getchar();
+          if (c3 == 'A') { // up
+            if (sel > 0)
+              sel--;
+          } else if (c3 == 'B') { // down
+            if (sel < nmatches - 1)
+              sel++;
+          }
+        }
+        continue;
+      }
+      result = -1; // lone Esc: cancel
+      break;
+    } else if (c == '\r' || c == '\n') { // Enter
+      if (nmatches > 0) {
+        const char *rel = all[matches[sel]];
+        if (rel[0])
+          snprintf(outpath, PATH_MAX, "%s/%s", base, rel);
+        else
+          snprintf(outpath, PATH_MAX, "%s", base);
+        result = 0;
+      }
+      break;
+    } else if (c == 127 || c == 8) { // backspace
+      if (qlen > 0) {
+        qlen--;
+        query[qlen] = '\0';
+        sel = 0;
+      }
+    } else if (c >= 32 && c < 127 && qlen < MAX_FILTER - 1) {
+      query[qlen++] = (char)c;
+      query[qlen] = '\0';
+      sel = 0;
+    }
+    // other control characters: ignore
   }
-  print_two_cols(subs, n);
-  printf("Select subdir number (enter for base): ");
-  char buf[BUF_SIZE];
-  if (!fgets(buf, sizeof(buf), stdin))
-    return -1;
-  if (buf[0] == '\n') {
-    strcpy(outpath, base);
-    return 0;
-  }
-  int choice = atoi(buf);
-  if (choice < 1 || choice > n)
-    return -1;
-  snprintf(outpath, PATH_MAX, "%s/%s", base, subs[choice - 1]);
-  return 0;
+
+  printf("\033[2J\033[H");
+  fflush(stdout);
+  enable_raw_mode(); // back to the program's normal raw-with-echo mode
+  return result;
 }
 
 void do_quickview(const char *file) {
@@ -663,8 +807,7 @@ ActionStatus cleanup_move_to_prev_dest(const char *file) {
                                                           : ACTION_CONTINUE_LOOP;
 }
 
-ActionStatus cleanup_move_to_configured_dest(const char *file,
-                                             struct termios *original_termios) {
+ActionStatus cleanup_move_to_configured_dest(const char *file) {
 
   if (ndirs == 0) {
     printf("No dirs in config.\n");
@@ -702,20 +845,12 @@ ActionStatus cleanup_move_to_configured_dest(const char *file,
 
   char target[PATH_MAX];
 
-  // Restore terminal for the fgets input
-  fflush(stdout);
-  /* restore_mode(&oldt); */
-  restore_mode(original_termios);
-
-  if (choose_subdir(dirs[found_idx].path, target) < 0) {
-    printf(RED "Subdir select error.\n" RESET);
-    /* oldt = enable_raw_mode(); */
-    enable_raw_mode();
+  // pick_dir_broot manages the terminal itself and leaves it back in the
+  // program's normal raw-with-echo mode before returning.
+  if (pick_dir_broot(dirs[found_idx].path, target) < 0) {
+    printf(RED "Move cancelled.\n" RESET);
     return ACTION_CONTINUE_LOOP;
   }
-
-  // Return to raw mode for single char inputs
-  enable_raw_mode();
 
   char dest[PATH_MAX];
   snprintf(dest, PATH_MAX, "%s/%s", target,
@@ -994,7 +1129,7 @@ int main(int argc, char *argv[]) {
 
         /* } else if (opt==5) { */
       } else if (opt == 109) { // input: 'm'ove
-        if (cleanup_move_to_configured_dest(file, &oldt) == ACTION_NEXT_FILE)
+        if (cleanup_move_to_configured_dest(file) == ACTION_NEXT_FILE)
           break;
         else
           continue;
