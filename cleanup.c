@@ -271,6 +271,19 @@ static struct termios enable_raw_mode_noecho(void) {
   return oldt;
 }
 
+/* Reads one raw byte from stdin via read(2), bypassing stdio's internal
+   buffer. pick_dir_broot mixes this with select() to peek for more pending
+   input (to tell a lone Esc apart from an arrow-key escape sequence); if it
+   used getchar() instead, a single terminal write of "ESC [ A" could be
+   slurped whole into stdio's buffer by the first getchar() call, leaving
+   the fd itself with nothing pending and making the select() peek
+   time out even though the rest of the sequence was already available. */
+static int read_raw_byte(void) {
+  unsigned char c;
+  ssize_t n = read(STDIN_FILENO, &c, 1);
+  return (n == 1) ? c : -1;
+}
+
 /* Broot-style interactive directory picker. Indexes every directory under
    base (base itself included, shown as "."), then lets the user narrow the
    list down by typing a fuzzy filter, moving the highlighted selection with
@@ -331,8 +344,8 @@ static int pick_dir_broot(const char *base, char *outpath) {
            nmatches, n);
     fflush(stdout);
 
-    int c = getchar();
-    if (c == EOF) {
+    int c = read_raw_byte();
+    if (c == -1) {
       result = -1;
       break;
     } else if (c == 27) { // Esc, or the start of an arrow-key sequence
@@ -341,9 +354,9 @@ static int pick_dir_broot(const char *base, char *outpath) {
       FD_ZERO(&fds);
       FD_SET(STDIN_FILENO, &fds);
       if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
-        int c2 = getchar();
+        int c2 = read_raw_byte();
         if (c2 == '[') {
-          int c3 = getchar();
+          int c3 = read_raw_byte();
           if (c3 == 'A') { // up
             if (sel > 0)
               sel--;
